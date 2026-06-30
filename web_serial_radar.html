@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Arduino Web Serial Radar</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            background-color: #0a0f0d;
+            color: #4ade80;
+            font-family: 'Courier New', Courier, monospace;
+            overflow: hidden; /* Prevent scrolling */
+        }
+        
+        #radar-container {
+            position: relative;
+            width: 100vw;
+            height: 75vh;
+            display: flex;
+            justify-content: center;
+            align-items: flex-end;
+            padding-bottom: 2rem;
+        }
+
+        canvas {
+            background: radial-gradient(circle at bottom, #001f11 0%, #000 70%);
+            border-bottom: 2px solid #4ade80;
+            border-radius: 50% 50% 0 0 / 100% 100% 0 0;
+            box-shadow: 0 0 50px rgba(74, 222, 128, 0.2);
+        }
+
+        /* Scanline effect */
+        .scanlines {
+            position: fixed;
+            top: 0; left: 0; width: 100vw; height: 100vh;
+            background: linear-gradient(
+                to bottom,
+                rgba(255,255,255,0),
+                rgba(255,255,255,0) 50%,
+                rgba(0,0,0,0.2) 50%,
+                rgba(0,0,0,0.2)
+            );
+            background-size: 100% 4px;
+            pointer-events: none;
+            z-index: 50;
+        }
+
+        /* CRT Flicker */
+        @keyframes flicker {
+            0% { opacity: 0.95; }
+            5% { opacity: 0.85; }
+            10% { opacity: 0.95; }
+            100% { opacity: 1; }
+        }
+        .crt { animation: flicker 0.15s infinite; }
+        
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body class="crt flex flex-col h-screen select-none">
+    <div class="scanlines"></div>
+
+    <!-- Header & Controls -->
+    <div class="p-6 flex flex-col md:flex-row justify-between items-center z-10 bg-black/60 border-b border-green-900/50">
+        <div class="mb-4 md:mb-0">
+            <h1 class="text-3xl font-bold text-green-400 tracking-widest uppercase text-shadow">SONAR / RADAR LINK</h1>
+            <p class="text-sm text-green-600">Awaiting Serial Telemetry...</p>
+        </div>
+        
+        <div class="flex gap-4 items-center">
+            <div class="flex flex-col">
+                <label class="text-xs text-green-600 mb-1">Baud Rate</label>
+                <select id="baudRate" class="bg-gray-900 border border-green-700 text-green-400 p-2 rounded outline-none focus:border-green-400">
+                    <option value="9600">9600</option>
+                    <option value="115200">115200</option>
+                </select>
+            </div>
+            <div class="flex flex-col">
+                <label class="text-xs text-green-600 mb-1">Max Distance (cm)</label>
+                <input type="number" id="maxDist" value="50" class="w-20 bg-gray-900 border border-green-700 text-green-400 p-2 rounded outline-none focus:border-green-400">
+            </div>
+            <button id="connectBtn" class="mt-5 bg-green-900/50 hover:bg-green-700 border border-green-500 text-green-300 font-bold py-2 px-6 rounded transition-colors uppercase tracking-widest shadow-[0_0_15px_rgba(74,222,128,0.3)]">
+                Connect Arduino
+            </button>
+            <button id="disconnectBtn" disabled class="mt-5 bg-red-900/30 hover:bg-red-900 border border-red-700 text-red-500 font-bold py-2 px-6 rounded transition-colors uppercase tracking-widest hidden">
+                Disconnect
+            </button>
+        </div>
+    </div>
+
+    <!-- Radar Canvas Area -->
+    <div id="radar-container" class="flex-grow">
+        <canvas id="radarCanvas"></canvas>
+    </div>
+
+    <!-- Status Bar -->
+    <div class="p-2 px-6 flex justify-between z-10 text-xs text-green-700 border-t border-green-900/50 bg-black/80">
+        <span id="connectionStatus">STATUS: OFFLINE</span>
+        <span id="lastData">LAST DATA: NULL</span>
+    </div>
+
+    <script>
+        // --- Web Serial API Logic ---
+        let port;
+        let reader;
+        let keepReading = true;
+
+        const connectBtn = document.getElementById('connectBtn');
+        const disconnectBtn = document.getElementById('disconnectBtn');
+        const statusEl = document.getElementById('connectionStatus');
+        const lastDataEl = document.getElementById('lastData');
+        const baudRateSelect = document.getElementById('baudRate');
+        
+        // Check browser support
+        if (!("serial" in navigator)) {
+            alert("Web Serial API is not supported in your browser. Please use Google Chrome or Microsoft Edge desktop versions.");
+            connectBtn.disabled = true;
+            connectBtn.innerText = "UNSUPPORTED";
+        }
+
+        connectBtn.addEventListener('click', async () => {
+            try {
+                // Request port from user
+                port = await navigator.serial.requestPort();
+                
+                // Open port
+                const baudRate = parseInt(baudRateSelect.value);
+                await port.open({ baudRate: baudRate });
+                
+                // Update UI
+                connectBtn.classList.add('hidden');
+                disconnectBtn.classList.remove('hidden');
+                disconnectBtn.disabled = false;
+                statusEl.innerText = "STATUS: ONLINE - SYNCING";
+                statusEl.classList.replace('text-green-700', 'text-green-400');
+                
+                keepReading = true;
+                readLoop();
+            } catch (error) {
+                console.error('Connection error:', error);
+                statusEl.innerText = "STATUS: CONNECTION FAILED";
+            }
+        });
+
+        disconnectBtn.addEventListener('click', async () => {
+            keepReading = false;
+            // Force the reader to cancel so the loop exits
+            if (reader) {
+                await reader.cancel();
+            }
+            
+            // Update UI
+            disconnectBtn.classList.add('hidden');
+            connectBtn.classList.remove('hidden');
+            statusEl.innerText = "STATUS: OFFLINE";
+            statusEl.classList.replace('text-green-400', 'text-green-700');
+        });
+
+        async function readLoop() {
+            const textDecoder = new TextDecoderStream();
+            const readableStreamClosed = port.readable.pipeTo(textDecoder.writable);
+            reader = textDecoder.readable.getReader();
+            
+            let buffer = "";
+
+            try {
+                while (keepReading) {
+                    const { value, done } = await reader.read();
+                    if (done) {
+                        break;
+                    }
+                    if (value) {
+                        buffer += value;
+                        // Split by newline to get complete data packets
+                        let lines = buffer.split('\n');
+                        
+                        // The last element might be an incomplete string, save it back to buffer
+                        buffer = lines.pop();
+                        
+                        for (let line of lines) {
+                            processData(line.trim());
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error("Read loop error:", error);
+            } finally {
+                reader.releaseLock();
+                await port.close();
+            }
+        }
+
+        // --- Radar & Canvas Logic ---
+        const canvas = document.getElementById('radarCanvas');
+        const ctx = canvas.getContext('2d');
+        const maxDistInput = document.getElementById('maxDist');
+        
+        let radarRadius = 0;
+        let currentAngle = 90; // Starting pointing straight up (90 deg)
+        let maxDistance = parseInt(maxDistInput.value);
+        
+        // Store blips: { angle, distance, age, x, y }
+        let blips = [];
+
+        function resizeCanvas() {
+            const container = document.getElementById('radar-container');
+            // Make width large, height half of width to fit perfectly
+            const maxSize = Math.min(container.clientWidth * 0.9, container.clientHeight * 1.8);
+            
+            canvas.width = maxSize;
+            canvas.height = maxSize / 2;
+            radarRadius = canvas.height - 10;
+        }
+
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        maxDistInput.addEventListener('change', (e) => {
+            maxDistance = parseInt(e.target.value) || 50;
+        });
+
+        // Parse incoming data: Expected format "Angle,Distance"
+        function processData(dataStr) {
+            if (!dataStr) return;
+            
+            lastDataEl.innerText = `LAST DATA: ${dataStr}`;
+            
+            const parts = dataStr.split(',');
+            if (parts.length >= 2) {
+                const angle = parseInt(parts[0]);
+                const distance = parseFloat(parts[1]);
+                
+                if (!isNaN(angle) && !isNaN(distance)) {
+                    currentAngle = angle;
+                    
+                    // If distance is within range, add a blip
+                    if (distance > 0 && distance <= maxDistance) {
+                        addBlip(angle, distance);
+                    }
+                }
+            }
+        }
+
+        function addBlip(angleDeg, distCm) {
+            // Convert angle for Canvas (0 is right, 180 is left usually)
+            // Assuming Arduino servo 0 is right, 180 is left:
+            const angleRad = (angleDeg * Math.PI) / 180;
+            
+            // Map distance to canvas radius
+            const distPx = (distCm / maxDistance) * radarRadius;
+            
+            // Calculate X and Y relative to bottom center
+            // standard trig: x = r * cos(theta), y = r * sin(theta)
+            // But canvas Y is inverted, so y = - (r * sin(theta))
+            const x = canvas.width / 2 + distPx * Math.cos(angleRad);
+            const y = canvas.height - distPx * Math.sin(angleRad);
+            
+            blips.push({
+                x: x,
+                y: y,
+                angleDeg: angleDeg,
+                distance: distCm,
+                age: 0,
+                intensity: 1.0 // 1.0 to 0.0 (fade out)
+            });
+        }
+
+        // Animation Loop
+        let lastTime = 0;
+        function drawRadar(timestamp) {
+            const deltaTime = timestamp - lastTime;
+            lastTime = timestamp;
+
+            // Clear canvas (with slight fade for trailing effect on the sweep)
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            const centerX = canvas.width / 2;
+            const centerY = canvas.height; // Bottom center
+
+            // 1. Draw Grid (Rings)
+            ctx.strokeStyle = "rgba(74, 222, 128, 0.3)";
+            ctx.lineWidth = 1.5;
+            
+            for (let i = 1; i <= 4; i++) {
+                ctx.beginPath();
+                const r = (radarRadius / 4) * i;
+                ctx.arc(centerX, centerY, r, Math.PI, 0, false);
+                ctx.stroke();
+                
+                // Add distance labels
+                ctx.fillStyle = "rgba(74, 222, 128, 0.6)";
+                ctx.font = "10px monospace";
+                ctx.fillText(`${(maxDistance / 4) * i}cm`, centerX + 5, centerY - r + 12);
+            }
+
+            // 2. Draw Grid (Angle Lines)
+            for (let a = 0; a <= 180; a += 30) {
+                ctx.beginPath();
+                ctx.moveTo(centerX, centerY);
+                const aRad = (a * Math.PI) / 180;
+                ctx.lineTo(centerX + radarRadius * Math.cos(aRad), centerY - radarRadius * Math.sin(aRad));
+                ctx.stroke();
+            }
+
+            // 3. Draw Blips (Obstacles)
+            for (let i = blips.length - 1; i >= 0; i--) {
+                const b = blips[i];
+                
+                // Draw blip
+                ctx.beginPath();
+                ctx.arc(b.x, b.y, 4 + (b.intensity * 2), 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(255, 50, 50, ${b.intensity})`;
+                ctx.fill();
+                
+                // Draw glow
+                ctx.beginPath();
+                ctx.arc(b.x, b.y, 10 + (b.intensity * 5), 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(255, 50, 50, ${b.intensity * 0.3})`;
+                ctx.fill();
+
+                // Draw tiny text next to fresh blips
+                if (b.intensity > 0.8) {
+                    ctx.fillStyle = `rgba(255, 255, 255, ${b.intensity})`;
+                    ctx.font = "10px monospace";
+                    ctx.fillText(`${b.distance.toFixed(1)}cm`, b.x + 8, b.y - 8);
+                }
+
+                // Age the blip
+                // Fades out over approx 2-3 seconds depending on frame rate
+                b.intensity -= 0.005; 
+                
+                if (b.intensity <= 0) {
+                    blips.splice(i, 1);
+                }
+            }
+
+            // 4. Draw Current Sweep Line
+            const currentRad = (currentAngle * Math.PI) / 180;
+            
+            // Draw a sweeping gradient trail
+            ctx.beginPath();
+            ctx.moveTo(centerX, centerY);
+            ctx.arc(centerX, centerY, radarRadius, currentRad + 0.2, currentRad, true); // small wedge
+            ctx.lineTo(centerX, centerY);
+            
+            const gradient = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, radarRadius);
+            gradient.addColorStop(0, "rgba(74, 222, 128, 0.0)");
+            gradient.addColorStop(1, "rgba(74, 222, 128, 0.4)");
+            ctx.fillStyle = gradient;
+            ctx.fill();
+
+            // Draw the solid bright leading line
+            ctx.beginPath();
+            ctx.moveTo(centerX, centerY);
+            ctx.lineTo(centerX + radarRadius * Math.cos(currentRad), centerY - radarRadius * Math.sin(currentRad));
+            ctx.strokeStyle = "#4ade80"; // Bright Green
+            ctx.lineWidth = 3;
+            // Add a little glow to the line
+            ctx.shadowBlur = 10;
+            ctx.shadowColor = "#4ade80";
+            ctx.stroke();
+            ctx.shadowBlur = 0; // reset
+
+            // Loop animation
+            requestAnimationFrame(drawRadar);
+        }
+
+        // Start animation loop
+        requestAnimationFrame(drawRadar);
+        
+    </script>
+</body>
+</html>
