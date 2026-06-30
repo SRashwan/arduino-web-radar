@@ -2,7 +2,7 @@
 
 A browser-based radar dashboard that connects to an Arduino via the Web Serial API. It operates entirely client-side without requiring a backend server.
 
-![Radar UI Preview](https://via.placeholder.com/800x400.png?text=Arduino+Web+Radar+UI)
+![Radar UI Preview]([https://via.placeholder.com/800x400.png?text=Arduino+Web+Radar+UI](https://raw.githubusercontent.com/SRashwan/arduino-web-radar/refs/heads/main/Screenshot_30-6-2026_32621_.jpeg))
 
 ## Features
 * **Direct Connection:** Uses the Web Serial API to read data from the USB port.
